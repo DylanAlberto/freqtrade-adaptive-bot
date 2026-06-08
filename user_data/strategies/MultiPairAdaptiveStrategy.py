@@ -121,9 +121,6 @@ _DEFAULTS: Dict[str, Any] = {
         "atr_multiplier_stop": 2.0,
         "atr_multiplier_entry": 1.0,
         "position_size_pct": 0.12,
-        "max_entries": 3,
-        "scale_distance_atr": 1.0,
-        "tp_scale_factor": 0.5,
     },
 }
 
@@ -206,6 +203,7 @@ class MultiPairAdaptiveStrategy(IStrategy):
         # Load per-pair parameters
         self.pair_params: Dict[str, Any] = _load_pair_params(config)
 
+        # Track which trades have done a 50% partial exit
         # Cache resolved params per pair
         self._params_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -239,11 +237,9 @@ class MultiPairAdaptiveStrategy(IStrategy):
                 "atr_multiplier_stop":  float(params["risk"]["atr_multiplier_stop"]),
                 "atr_multiplier_entry": float(params["risk"]["atr_multiplier_entry"]),
                 "atr_multiplier_tp":    float(params["risk"].get("atr_multiplier_tp", 4.0)),
+                "atr_multiplier_trail_offset": float(params["risk"].get("atr_multiplier_trail_offset", 2.0)),
                 "position_size_pct":    float(params["risk"].get("position_size_pct", 0.10)),
                 "max_trade_minutes":    int(params["risk"].get("max_trade_minutes", 240)),
-                "max_entries":          int(params["risk"].get("max_entries", 3)),
-                "scale_distance_atr":   float(params["risk"].get("scale_distance_atr", 1.0)),
-                "tp_scale_factor":      float(params["risk"].get("tp_scale_factor", 0.5)),
             }
         else:
             # Use hyperopt-testable parameters (falls back to defaults)
@@ -258,11 +254,9 @@ class MultiPairAdaptiveStrategy(IStrategy):
                 "atr_multiplier_stop":  self.atr_stop_mult.value,
                 "atr_multiplier_entry": 1.0,
                 "atr_multiplier_tp":    4.0,
+                "atr_multiplier_trail_offset": 2.0,
                 "position_size_pct":    0.10,
                 "max_trade_minutes":    240,
-                "max_entries":          3,
-                "scale_distance_atr":   1.0,
-                "tp_scale_factor":      0.5,
             }
 
         self._params_cache[pair] = resolved
@@ -365,49 +359,6 @@ class MultiPairAdaptiveStrategy(IStrategy):
         except Exception:
             dataframe["ema50_direction"] = 1
 
-        # --- 9. CVD momentum + Time-in-Oversold (agotamiento) ----------
-        try:
-            dataframe["cvd_rising"] = (dataframe["cvd"].diff(1) > 0).astype(int)
-            cvd_diff = dataframe["cvd"].diff(1)
-            dataframe["cvd_not_falling"] = (cvd_diff >= cvd_diff.shift(1)).fillna(1).astype(int)
-            dataframe["cvd_not_rising"] = (cvd_diff <= cvd_diff.shift(1)).fillna(1).astype(int)
-            
-            # Oscillator oversold/overbought candle counter (simplified)
-            p_os = p["stochrsi_oversold"]
-            p_ob = p["stochrsi_overbought"]
-            
-            # Rolling count - faster method without groupby
-            os_count = 0
-            ob_count = 0
-            os_list, ob_list = [], []
-            for val in dataframe["stochrsi_k_fast"].values:
-                os_count = os_count + 1 if val < p_os else 0
-                ob_count = ob_count + 1 if val > p_ob else 0
-                os_list.append(os_count)
-                ob_list.append(ob_count)
-            
-            dataframe["stochrsi_os_candles"] = os_list
-            dataframe["stochrsi_ob_candles"] = ob_list
-            
-            dataframe["exhaustion_exit_short"] = (
-                (dataframe["stochrsi_os_candles"] >= 3) &
-                (dataframe["cvd_not_falling"] == 1)
-            ).astype(int)
-            
-            dataframe["exhaustion_exit_long"] = (
-                (dataframe["stochrsi_ob_candles"] >= 3) &
-                (dataframe["cvd_not_rising"] == 1)
-            ).astype(int)
-        except Exception as exc:
-            logger.warning(f"Section 9 failed: {exc}")
-            dataframe["cvd_rising"] = 1
-            dataframe["cvd_not_falling"] = 1
-            dataframe["cvd_not_rising"] = 1
-            dataframe["stochrsi_os_candles"] = 0
-            dataframe["stochrsi_ob_candles"] = 0
-            dataframe["exhaustion_exit_short"] = 0
-            dataframe["exhaustion_exit_long"] = 0
-
         return dataframe
 
     # ------------------------------------------------------------------
@@ -478,49 +429,6 @@ class MultiPairAdaptiveStrategy(IStrategy):
             "enter_short",
         ] = 1
 
-        # --- 9. CVD momentum + Time-in-Oversold (agotamiento) ----------
-        try:
-            dataframe["cvd_rising"] = (dataframe["cvd"].diff(1) > 0).astype(int)
-            cvd_diff = dataframe["cvd"].diff(1)
-            dataframe["cvd_not_falling"] = (cvd_diff >= cvd_diff.shift(1)).fillna(1).astype(int)
-            dataframe["cvd_not_rising"] = (cvd_diff <= cvd_diff.shift(1)).fillna(1).astype(int)
-            
-            # Oscillator oversold/overbought candle counter (simplified)
-            p_os = p["stochrsi_oversold"]
-            p_ob = p["stochrsi_overbought"]
-            
-            # Rolling count - faster method without groupby
-            os_count = 0
-            ob_count = 0
-            os_list, ob_list = [], []
-            for val in dataframe["stochrsi_k_fast"].values:
-                os_count = os_count + 1 if val < p_os else 0
-                ob_count = ob_count + 1 if val > p_ob else 0
-                os_list.append(os_count)
-                ob_list.append(ob_count)
-            
-            dataframe["stochrsi_os_candles"] = os_list
-            dataframe["stochrsi_ob_candles"] = ob_list
-            
-            dataframe["exhaustion_exit_short"] = (
-                (dataframe["stochrsi_os_candles"] >= 3) &
-                (dataframe["cvd_not_falling"] == 1)
-            ).astype(int)
-            
-            dataframe["exhaustion_exit_long"] = (
-                (dataframe["stochrsi_ob_candles"] >= 3) &
-                (dataframe["cvd_not_rising"] == 1)
-            ).astype(int)
-        except Exception as exc:
-            logger.warning(f"Section 9 failed: {exc}")
-            dataframe["cvd_rising"] = 1
-            dataframe["cvd_not_falling"] = 1
-            dataframe["cvd_not_rising"] = 1
-            dataframe["stochrsi_os_candles"] = 0
-            dataframe["stochrsi_ob_candles"] = 0
-            dataframe["exhaustion_exit_short"] = 0
-            dataframe["exhaustion_exit_long"] = 0
-
         return dataframe
 
     # ------------------------------------------------------------------
@@ -528,82 +436,15 @@ class MultiPairAdaptiveStrategy(IStrategy):
     # ------------------------------------------------------------------
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        pair = metadata["pair"]
-        p    = self._params_for(pair)
-
+        """
+        Simplified: only CVD divergence exits.
+        StochRSI exits handled in custom_exit for per-trade control.
+        """
         dataframe.loc[:, "exit_long"]  = 0
         dataframe.loc[:, "exit_short"] = 0
 
-        # Exit LONG:
-        # 1. StochRSI crosses below OB + CVD NOT rising (liquidity void)
-        # 2. Exhaustion: 3+ candles above OB + CVD flat
-        # 3. Bearish CVD divergence
-        dataframe.loc[
-            (
-                crossed_below(dataframe["stochrsi_k_fast"], p["stochrsi_overbought"]) &
-                (dataframe["cvd_rising"] == 0)
-            ) |
-            (dataframe["exhaustion_exit_long"] == 1) |
-            (dataframe["cvd_div_neg"] == 1),
-            "exit_long",
-        ] = 1
-
-        # Exit SHORT:
-        # 1. StochRSI crosses above OS + CVD rising (real bounce)
-        # 2. Exhaustion: 3+ candles below OS + CVD flat
-        # 3. Bullish CVD divergence
-        dataframe.loc[
-            (
-                crossed_above(dataframe["stochrsi_k_fast"], p["stochrsi_oversold"]) &
-                (dataframe["cvd_rising"] == 1)
-            ) |
-            (dataframe["exhaustion_exit_short"] == 1) |
-            (dataframe["cvd_div_pos"] == 1),
-            "exit_short",
-        ] = 1
-
-        # --- 9. CVD momentum + Time-in-Oversold (agotamiento) ----------
-        try:
-            dataframe["cvd_rising"] = (dataframe["cvd"].diff(1) > 0).astype(int)
-            cvd_diff = dataframe["cvd"].diff(1)
-            dataframe["cvd_not_falling"] = (cvd_diff >= cvd_diff.shift(1)).fillna(1).astype(int)
-            dataframe["cvd_not_rising"] = (cvd_diff <= cvd_diff.shift(1)).fillna(1).astype(int)
-            
-            # Oscillator oversold/overbought candle counter (simplified)
-            p_os = p["stochrsi_oversold"]
-            p_ob = p["stochrsi_overbought"]
-            
-            # Rolling count - faster method without groupby
-            os_count = 0
-            ob_count = 0
-            os_list, ob_list = [], []
-            for val in dataframe["stochrsi_k_fast"].values:
-                os_count = os_count + 1 if val < p_os else 0
-                ob_count = ob_count + 1 if val > p_ob else 0
-                os_list.append(os_count)
-                ob_list.append(ob_count)
-            
-            dataframe["stochrsi_os_candles"] = os_list
-            dataframe["stochrsi_ob_candles"] = ob_list
-            
-            dataframe["exhaustion_exit_short"] = (
-                (dataframe["stochrsi_os_candles"] >= 3) &
-                (dataframe["cvd_not_falling"] == 1)
-            ).astype(int)
-            
-            dataframe["exhaustion_exit_long"] = (
-                (dataframe["stochrsi_ob_candles"] >= 3) &
-                (dataframe["cvd_not_rising"] == 1)
-            ).astype(int)
-        except Exception as exc:
-            logger.warning(f"Section 9 failed: {exc}")
-            dataframe["cvd_rising"] = 1
-            dataframe["cvd_not_falling"] = 1
-            dataframe["cvd_not_rising"] = 1
-            dataframe["stochrsi_os_candles"] = 0
-            dataframe["stochrsi_ob_candles"] = 0
-            dataframe["exhaustion_exit_short"] = 0
-            dataframe["exhaustion_exit_long"] = 0
+        dataframe.loc[dataframe["cvd_div_neg"] == 1, "exit_long"] = 1
+        dataframe.loc[dataframe["cvd_div_pos"] == 1, "exit_short"] = 1
 
         return dataframe
 
@@ -622,12 +463,18 @@ class MultiPairAdaptiveStrategy(IStrategy):
         **kwargs,
     ) -> Optional[float]:
         p = self._params_for(pair)
+        partial = self._partial_exits.get(trade.id, False)
 
-        # Get the most recent analysed candle for this pair
+        # --- Breakeven after partial exit ---
+        if partial:
+            be_stop = trade.open_rate * 0.999  # 0.1% below entry for fees
+            stoploss_rel = (be_stop - trade.open_rate) / trade.open_rate
+            return max(stoploss_rel, -0.15)
+
         try:
             dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         except Exception:
-            return self.stoploss  # fallback during warmup
+            return self.stoploss
 
         if dataframe is None or dataframe.empty:
             return self.stoploss
@@ -638,16 +485,21 @@ class MultiPairAdaptiveStrategy(IStrategy):
         if atr is None or np.isnan(atr) or atr == 0:
             return self.stoploss
 
-        # --- ATR-based trailing stop ---
-        # stop = current_price - (ATR * multiplier)
-        # As price rises, stop trails up automatically
-        # As volatility expands/contracts, stop widens/tightens dynamically
-        stop_price = current_rate - (atr * p["atr_multiplier_stop"])
+        stop_mult = p["atr_multiplier_stop"]
+        trail_offset = p.get("atr_multiplier_trail_offset", 2.0)
 
-        # Convert to Freqtrade's open_rate-relative format
-        stoploss_rel = (stop_price - trade.open_rate) / trade.open_rate
+        # --- Offset: don't trail until offset is reached ---
+        offset_level = (atr * trail_offset) / trade.open_rate
 
-        # Cap at 15% max loss from entry
+        if current_profit < offset_level:
+            # Stay at initial stop, don't chase price
+            stop_price = trade.open_rate - (atr * stop_mult)
+            stoploss_rel = (stop_price - trade.open_rate) / trade.open_rate
+        else:
+            # ATR-based trailing stop
+            stop_price = current_rate - (atr * stop_mult)
+            stoploss_rel = (stop_price - trade.open_rate) / trade.open_rate
+
         return max(stoploss_rel, -0.15)
 
     # ------------------------------------------------------------------
@@ -667,13 +519,18 @@ class MultiPairAdaptiveStrategy(IStrategy):
         **kwargs,
     ) -> Optional[float]:
         """
-        Scale-in during strong trends.
-        Adds same-sized entries at ATR intervals.
+        Sell 50% of position at 1:1 risk/reward.
+        Remaining 50% runs until take_profit or exit_signal.
         """
+        if current_profit < 0:
+            return None  # not profitable yet
+
+        # Track which trades already did the 50% exit
+        partial_key = f"partial_{trade.id}"
+        if partial_key in self._partial_exits:
+            return None  # already reduced
+
         p = self._params_for(trade.pair)
-        max_entries = p.get("max_entries", 3)
-        if trade.nr_of_successful_entries >= max_entries:
-            return None
 
         try:
             dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
@@ -691,6 +548,7 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
         if current_profit > stop_distance:
             # Sell 50% — negative amount reduces position
+            self._partial_exits.add(partial_key)
             logger.info(
                 f"Partial exit 50% at {current_profit:.2%} profit for {trade.pair}"
             )
@@ -712,13 +570,11 @@ class MultiPairAdaptiveStrategy(IStrategy):
         **kwargs,
     ) -> Optional[str]:
         """
-        Dynamic take-profit decreasing with each scale-in entry.
-        Entry 1 -> 4x ATR, Entry 2 -> 2x ATR, Entry 3 -> 1x ATR.
+        Stage 2 exit: ATR take-profit + Time-Based Exit for remaining 50%.
+        Stage 1 (50% at 1:1) is handled by adjust_trade_position().
         """
         p = self._params_for(pair)
         tp_mult = p.get("atr_multiplier_tp", 4.0)
-        tp_scale = p.get("tp_scale_factor", 0.5)
-        entries = trade.nr_of_successful_entries
         max_minutes = p.get("max_trade_minutes", 240)
 
         # --- Time-Based Exit: kill zombie trades -----------------------
@@ -738,8 +594,7 @@ class MultiPairAdaptiveStrategy(IStrategy):
         if atr is None or np.isnan(atr) or atr == 0:
             return None
 
-        effective_tp = tp_mult * (tp_scale ** (entries - 1))
-        tp_target = (atr * effective_tp) / trade.open_rate
+        tp_target = (atr * tp_mult) / trade.open_rate
         if current_profit > tp_target:
             return "take_profit"
 
@@ -890,48 +745,5 @@ class MultiPairAdaptiveStrategy(IStrategy):
             self.timeframe, tf,
             ffill=True,
         )
-
-        # --- 9. CVD momentum + Time-in-Oversold (agotamiento) ----------
-        try:
-            dataframe["cvd_rising"] = (dataframe["cvd"].diff(1) > 0).astype(int)
-            cvd_diff = dataframe["cvd"].diff(1)
-            dataframe["cvd_not_falling"] = (cvd_diff >= cvd_diff.shift(1)).fillna(1).astype(int)
-            dataframe["cvd_not_rising"] = (cvd_diff <= cvd_diff.shift(1)).fillna(1).astype(int)
-            
-            # Oscillator oversold/overbought candle counter (simplified)
-            p_os = p["stochrsi_oversold"]
-            p_ob = p["stochrsi_overbought"]
-            
-            # Rolling count - faster method without groupby
-            os_count = 0
-            ob_count = 0
-            os_list, ob_list = [], []
-            for val in dataframe["stochrsi_k_fast"].values:
-                os_count = os_count + 1 if val < p_os else 0
-                ob_count = ob_count + 1 if val > p_ob else 0
-                os_list.append(os_count)
-                ob_list.append(ob_count)
-            
-            dataframe["stochrsi_os_candles"] = os_list
-            dataframe["stochrsi_ob_candles"] = ob_list
-            
-            dataframe["exhaustion_exit_short"] = (
-                (dataframe["stochrsi_os_candles"] >= 3) &
-                (dataframe["cvd_not_falling"] == 1)
-            ).astype(int)
-            
-            dataframe["exhaustion_exit_long"] = (
-                (dataframe["stochrsi_ob_candles"] >= 3) &
-                (dataframe["cvd_not_rising"] == 1)
-            ).astype(int)
-        except Exception as exc:
-            logger.warning(f"Section 9 failed: {exc}")
-            dataframe["cvd_rising"] = 1
-            dataframe["cvd_not_falling"] = 1
-            dataframe["cvd_not_rising"] = 1
-            dataframe["stochrsi_os_candles"] = 0
-            dataframe["stochrsi_ob_candles"] = 0
-            dataframe["exhaustion_exit_short"] = 0
-            dataframe["exhaustion_exit_long"] = 0
 
         return dataframe
