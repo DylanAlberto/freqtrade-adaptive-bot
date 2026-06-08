@@ -12,56 +12,97 @@ Regime filter via ΔCVD(1H):
   |ΔCVD| ≤ threshold  → Range Regime       → trade mean-reversion via StochRSI
 
 Per-pair parameters injected from pair_params.json (output of Bayesian Hyperopt).
+Compatible with Freqtrade backtesting + live trading (INTERFACE_VERSION 3).
 """
 
-from pathlib     import Path
-from typing      import Dict, Any, Optional
+import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
 
+from freqtrade.persistence import Trade
 from freqtrade.strategy import (
     IStrategy,
     IntParameter,
     DecimalParameter,
-    CategoricalParameter,
-    informative,
+    merge_informative_pair,
 )
-from freqtrade.persistence import Trade
 from pandas import DataFrame
+
+try:
+    from freqtrade.vendor.qtpylib.indicators import crossed_above, crossed_below
+except ImportError:
+    # Fallback implementations if qtpylib not available
+    def crossed_above(series1, series2):
+        return (series1.shift(1) <= series2.shift(1)) & (series1 > series2)
+
+    def crossed_below(series1, series2):
+        return (series1.shift(1) >= series2.shift(1)) & (series1 < series2)
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _approx_cvd(dataframe: DataFrame, period: int = 1) -> pd.Series:
+def _approx_cvd(close: pd.Series, open_: pd.Series, volume: pd.Series) -> pd.Series:
     """
     Approximate Cumulative Volume Delta from OHLCV data.
     delta  = (close - open) * volume    — raw delta per candle
     cvd    = cumulative sum of delta
     """
-    delta = (dataframe["close"] - dataframe["open"]) * dataframe["volume"]
+    delta = (close - open_) * volume
     return delta.cumsum()
 
 
-def _load_pair_params(path: str) -> Dict[str, Any]:
+def _load_pair_params(config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Load per-pair parameter dictionary from a JSON file.
-    Falls back to empty dict so the strategy defaults always apply.
+    Load per-pair parameter dictionary from pair_params.json.
+    Search order:
+      1. Absolute path from config key 'pair_params_path'
+      2. Relative to config['user_data_dir']/../pair_params.json
+      3. Relative to this file's directory: ../../pair_params.json
+      4. Current working directory
+    Falls back to empty dict so strategy defaults always apply.
     """
-    import json
-    p = Path(path)
-    if not p.exists():
-        return {}
-    with p.open("r") as f:
-        raw = json.load(f)
-        # strip metadata key if present
-        return {k: v for k, v in raw.items() if k != "metadata"}
+    search_paths = []
+
+    # 1. Explicit config key
+    if "pair_params_path" in config:
+        search_paths.append(Path(config["pair_params_path"]))
+
+    # 2. user_data_dir parallel
+    if "user_data_dir" in config:
+        search_paths.append(Path(config["user_data_dir"]).parent / "pair_params.json")
+
+    # 3. Relative to strategy file
+    search_paths.append(Path(__file__).resolve().parent.parent.parent / "pair_params.json")
+
+    # 4. CWD
+    search_paths.append(Path.cwd() / "pair_params.json")
+
+    for path in search_paths:
+        try:
+            if path.exists():
+                with path.open() as f:
+                    raw = json.load(f)
+                    params = {k: v for k, v in raw.items() if k != "metadata"}
+                    logger.info(f"Loaded per-pair parameters from {path} — {list(params.keys())}")
+                    return params
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(f"Failed to load pair_params from {path}: {exc}")
+
+    logger.info("No pair_params.json found — using hardcoded defaults")
+    return {}
 
 
 # ---------------------------------------------------------------------------
-# Default parameters (used when pair_params.json entry is missing)
+# Default parameters per pair (used when pair_params.json is absent)
 # ---------------------------------------------------------------------------
 
 _DEFAULTS: Dict[str, Any] = {
@@ -93,7 +134,7 @@ class MultiPairAdaptiveStrategy(IStrategy):
     Adapts execution logic per trading pair using a combination of
     StochRSI (momentum), CVD (order-flow), and ATR (volatility).
 
-    Parameters are loaded from ``pair_params.json`` at the strategy root,
+    Parameters are loaded from **pair_params.json** at initialisation,
     normally produced by Freqtrade's Bayesian Hyperopt engine.
     """
 
@@ -102,28 +143,26 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
     can_short = True
 
-    # These timeframes are overridden per-pair at runtime once we know the
-    # pair-specific parameters. We set sensible defaults here.
+    # These are overridden per-pair at runtime once we know the pair's
+    # dedicated timeframe. Keep 5m as the default for startup.
     timeframe: str = "5m"
     informative_timeframe: str = "1h"
-    minimum_informative_tf: str = "1h"
 
-    # Stoploss is dynamic (custom_stoploss), but Freqtrade needs a hard
-    # default as fallback.
+    # Hard stoploss fallback — overridden dynamically by custom_stoploss()
     stoploss = -0.05
 
-    # ROI table — disabled; exit is signal-based
+    # ROI table disabled (exit is signal-based)
     minimal_roi = {"0": 100.0}
 
-    # Tracer
+    # Warmup candles needed for all indicators
     startup_candle_count: int = 100
 
-    # Hyperopt spaces (used when pair_params.json is absent)
-    stochrsi_period   = IntParameter(5, 25, default=10, space="buy")
-    stochrsi_oversold = IntParameter(10, 35, default=20, space="buy")
-    stochrsi_overbought = IntParameter(65, 90, default=80, space="sell")
-    cvd_threshold     = DecimalParameter(0.05, 0.50, default=0.20, space="buy")
-    atr_stop_mult     = DecimalParameter(1.0, 4.0, default=2.0, space="sell")
+    # --- Hyperopt spaces (fallback when pair_params.json absent) ------
+    stochrsi_period      = IntParameter(5, 25, default=10, space="buy")
+    stochrsi_oversold    = IntParameter(10, 35, default=20, space="buy")
+    stochrsi_overbought  = IntParameter(65, 90, default=80, space="sell")
+    cvd_threshold        = DecimalParameter(0.05, 0.50, default=0.20, space="buy")
+    atr_stop_mult        = DecimalParameter(1.0, 4.0, default=2.0, space="sell")
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -132,16 +171,8 @@ class MultiPairAdaptiveStrategy(IStrategy):
     def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__(config)
 
-        # Locate the parameter file relative to the strategy file
-        strategy_dir = Path(__file__).resolve().parent
-        params_file   = strategy_dir.parent.parent / "pair_params.json"
-
-        self.pair_params: Dict[str, Any] = _load_pair_params(str(strategy_dir.parent.parent / "pair_params.json"))
-
-        if self.pair_params:
-            self.log.info(f"Loaded per-pair parameters for {list(self.pair_params.keys())}")
-        else:
-            self.log.info("No pair_params.json found — using defaults + hyperopt parameters")
+        # Load per-pair parameters
+        self.pair_params: Dict[str, Any] = _load_pair_params(config)
 
         # Cache resolved params per pair
         self._params_cache: Dict[str, Dict[str, Any]] = {}
@@ -157,17 +188,16 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
         params = self.pair_params.get(pair, _DEFAULTS)
 
-        # Merge with global hyperopt parameters when *not* per-pair
         resolved = {
-            "stochrsi_period":       params["stochrsi"]["period"],
-            "stochrsi_smooth_k":     params["stochrsi"]["smooth_k"],
-            "stochrsi_smooth_d":     params["stochrsi"]["smooth_d"],
-            "stochrsi_oversold":     params["stochrsi"]["oversold"],
-            "stochrsi_overbought":   params["stochrsi"]["overbought"],
-            "cvd_delta_period":      params["cvd"]["delta_period"],
-            "cvd_threshold":         params["cvd"]["threshold"],
-            "atr_multiplier_stop":   params["risk"]["atr_multiplier_stop"],
-            "atr_multiplier_entry":  params["risk"]["atr_multiplier_entry"],
+            "stochrsi_period":      int(params["stochrsi"]["period"]),
+            "stochrsi_smooth_k":    int(params["stochrsi"]["smooth_k"]),
+            "stochrsi_smooth_d":    int(params["stochrsi"]["smooth_d"]),
+            "stochrsi_oversold":    float(params["stochrsi"]["oversold"]),
+            "stochrsi_overbought":  float(params["stochrsi"]["overbought"]),
+            "cvd_delta_period":     int(params["cvd"]["delta_period"]),
+            "cvd_threshold":        float(params["cvd"]["threshold"]),
+            "atr_multiplier_stop":  float(params["risk"]["atr_multiplier_stop"]),
+            "atr_multiplier_entry": float(params["risk"]["atr_multiplier_entry"]),
         }
 
         self._params_cache[pair] = resolved
@@ -189,90 +219,85 @@ class MultiPairAdaptiveStrategy(IStrategy):
         pair = metadata["pair"]
         p    = self._params_for(pair)
 
-        # --- 1. CVD (raw + approximated) on current timeframe ---------
-        dataframe["cvd_raw"]  = (dataframe["close"] - dataframe["open"]) * dataframe["volume"]
-        dataframe["cvd"]      = _approx_cvd(dataframe)
+        # --- 1. CVD (raw delta + cumulative) on the base timeframe -----
+        dataframe["cvd_raw"] = (dataframe["close"] - dataframe["open"]) * dataframe["volume"]
+        dataframe["cvd"]     = dataframe["cvd_raw"].cumsum()
 
-        # --- 2. Stochastic RSI -----------------------------------------
+        # --- 2. Stochastic RSI ------------------------------------------
         self._populate_stochrsi(dataframe, p)
 
-        # --- 3. ATR ----------------------------------------------------
+        # --- 3. ATR -----------------------------------------------------
         import talib.abstract as ta
-        dataframe["atr"] = ta.ATR(
-            dataframe,
-            timeperiod=max(p["stochrsi_period"], 14),
-        )
+        atr_period = max(p["stochrsi_period"], 14)
+        dataframe["atr"] = ta.ATR(dataframe, timeperiod=atr_period)
 
-        # --- 4. CVD rate-of-change (regime detection) ------------------
-        delta_series = dataframe["cvd"].diff(p["cvd_delta_period"])
-        dataframe["cvd_delta"] = delta_series
-        dataframe["cvd_delta_abs"] = delta_series.abs()
+        # --- 4. CVD rate-of-change on base TF (regime helper) -----------
+        dataframe["cvd_delta"]    = dataframe["cvd"].diff(p["cvd_delta_period"])
+        dataframe["cvd_delta_abs"] = dataframe["cvd_delta"].abs()
         dataframe["regime_trend"] = (dataframe["cvd_delta_abs"] > p["cvd_threshold"]).astype(int)
 
-        # --- 5. Divergence signal --------------------------------------
-        # Price dropping but CVD increasing → bullish absorption
+        # --- 5. CVD-close divergences -----------------------------------
+        _fast = max(p["cvd_delta_period"] // 2, 2)
         dataframe["cvd_div_pos"] = (
-            (dataframe["close"].diff(3) < 0) &
-            (dataframe["cvd"].diff(3) > 0)
+            (dataframe["close"].diff(_fast) < 0) &
+            (dataframe["cvd"].diff(_fast) > 0)
         ).astype(int)
 
-        # Price rising but CVD decreasing → bearish distribution
         dataframe["cvd_div_neg"] = (
-            (dataframe["close"].diff(3) > 0) &
-            (dataframe["cvd"].diff(3) < 0)
+            (dataframe["close"].diff(_fast) > 0) &
+            (dataframe["cvd"].diff(_fast) < 0)
         ).astype(int)
 
-        # --- 6. CVD on 1H informative (via merge) ---------------------- 
-        # Attach 1H CVD for regime detection on the *current* candle
+        # --- 6. Informative (1H) CVD for regime filter ------------------
+        # This merges CVD columns from the 1H timeframe onto the base df.
         dataframe = self._attach_informative_cvd(dataframe, metadata)
 
         return dataframe
 
     # ------------------------------------------------------------------
-    # Buy / Short signals
+    # Entry signals
     # ------------------------------------------------------------------
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         pair = metadata["pair"]
         p    = self._params_for(pair)
 
-        # Conditions shared across regimes
         dataframe.loc[:, "enter_long"]  = 0
         dataframe.loc[:, "enter_short"] = 0
 
-        # --- Trend Regime ----------------------------------------------
+        # --- Trend Regime -----------------------------------------------
         trend_mask = dataframe["regime_trend"] == 1
 
-        # LONG: StochRSI_k crossing above oversold + CVD delta positive
+        # LONG: StochRSI_k crosses above oversold + CVD delta positive
         dataframe.loc[
             trend_mask &
-            qtpylib.crossed_above(dataframe["stochrsi_k"], p["stochrsi_oversold"]) &
+            crossed_above(dataframe["stochrsi_k"], p["stochrsi_oversold"]) &
             (dataframe["cvd_delta"] > 0),
             "enter_long",
         ] = 1
 
-        # SHORT: StochRSI_k crossing below overbought + CVD delta negative
+        # SHORT: StochRSI_k crosses below overbought + CVD delta negative
         dataframe.loc[
             trend_mask &
-            qtpylib.crossed_below(dataframe["stochrsi_k"], p["stochrsi_overbought"]) &
+            crossed_below(dataframe["stochrsi_k"], p["stochrsi_overbought"]) &
             (dataframe["cvd_delta"] < 0),
             "enter_short",
         ] = 1
 
-        # --- Range Regime ----------------------------------------------
+        # --- Range Regime -----------------------------------------------
         range_mask = dataframe["regime_trend"] == 0
 
         # LONG: oversold bounce
         dataframe.loc[
             range_mask &
-            qtpylib.crossed_above(dataframe["stochrsi_k"], p["stochrsi_oversold"]),
+            crossed_above(dataframe["stochrsi_k"], p["stochrsi_oversold"]),
             "enter_long",
         ] = 1
 
         # SHORT: overbought rejection
         dataframe.loc[
             range_mask &
-            qtpylib.crossed_below(dataframe["stochrsi_k"], p["stochrsi_overbought"]),
+            crossed_below(dataframe["stochrsi_k"], p["stochrsi_overbought"]),
             "enter_short",
         ] = 1
 
@@ -289,16 +314,14 @@ class MultiPairAdaptiveStrategy(IStrategy):
         dataframe.loc[:, "exit_long"]  = 0
         dataframe.loc[:, "exit_short"] = 0
 
-        # Exit LONG when StochRSI reaches overbought in range regime
-        # or when CVD divergence turns bearish
+        # Exit LONG: StochRSI reaches overbought OR bearish CVD divergence
         dataframe.loc[
             (dataframe["stochrsi_k"] >= p["stochrsi_overbought"]) |
             (dataframe["cvd_div_neg"] == 1),
             "exit_long",
         ] = 1
 
-        # Exit SHORT when StochRSI reaches oversold in range regime
-        # or when CVD divergence turns bullish
+        # Exit SHORT: StochRSI reaches oversold OR bullish CVD divergence
         dataframe.loc[
             (dataframe["stochrsi_k"] <= p["stochrsi_oversold"]) |
             (dataframe["cvd_div_pos"] == 1),
@@ -323,10 +346,14 @@ class MultiPairAdaptiveStrategy(IStrategy):
     ) -> Optional[float]:
         p = self._params_for(pair)
 
-        # ATR comes from the last available row for this pair
-        dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        # Get the most recent analysed candle for this pair
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+        except Exception:
+            return self.stoploss  # fallback during warmup
+
         if dataframe is None or dataframe.empty:
-            return self.stoploss  # fallback
+            return self.stoploss
 
         last_candle = dataframe.iloc[-1]
         atr = last_candle.get("atr")
@@ -336,25 +363,24 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
         # Dynamic stop = ATR * multiplier, as fraction of entry price
         atr_stop_pct = (atr * p["atr_multiplier_stop"]) / trade.open_rate
-        return -min(atr_stop_pct, 0.15)  # cap at 15 %
+        return -min(atr_stop_pct, 0.15)  # cap at 15%
 
     # ================================================================
     # Private helpers
     # ================================================================
 
     def _populate_stochrsi(self, dataframe: DataFrame, p: Dict[str, Any]) -> None:
-        """Add StochRSI columns to *dataframe*."""
+        """Add StochRSI %K and %D columns."""
         import talib.abstract as ta
 
-        # RSI first
         rsi = ta.RSI(dataframe, timeperiod=p["stochrsi_period"])
 
-        # Stochastic of RSI
+        # STOCHF (Fast Stochastic) of RSI
         stoch = ta.STOCHF(
             pd.DataFrame({
-                "high":   rsi,
-                "low":    rsi,
-                "close":  rsi,
+                "high":  rsi,
+                "low":   rsi,
+                "close": rsi,
             }),
             fastk_period=p["stochrsi_period"],
             fastd_period=p["stochrsi_smooth_d"],
@@ -370,55 +396,45 @@ class MultiPairAdaptiveStrategy(IStrategy):
         metadata: dict,
     ) -> DataFrame:
         """
-        Merge 1H CVD delta into the current dataframe for regime detection.
-        Uses Freqtrade's built-in informative pair helper.
+        Fetch 1H data for the current pair, compute CVD, and merge
+        the regime-relevant columns onto the base dataframe.
+
+        This approach works identically in backtesting and live trading.
         """
         pair = metadata["pair"]
-        p    = self._params_for(pair)
+        tf   = self.informative_timeframe
 
-        # We rely on the informative caching mechanism of Freqtrade.
-        # If informative data is not ready (first candles), fall through.
+        # Fetch the 1H dataframe
         try:
-            informative = self.dp.get_pair_dataframe(pair, self.informative_timeframe)
-            if informative is None or informative.empty:
-                return dataframe
-
-            # Compute CVD on the 1H dataframe
-            informative["cvd_1h_raw"] = (
-                (informative["close"] - informative["open"]) * informative["volume"]
-            )
-            informative["cvd_1h"] = informative["cvd_1h_raw"].cumsum()
-
-            informative["cvd_1h_delta"] = informative["cvd_1h"].diff(p["cvd_delta_period"] * 3)
-            informative["cvd_1h_delta_abs"] = informative["cvd_1h_delta"].abs()
-
-            informative.rename(
-                columns={
-                    "cvd_1h":           "cvd_1h",
-                    "cvd_1h_delta":     "cvd_1h_delta",
-                    "cvd_1h_delta_abs": "cvd_1h_delta_abs",
-                },
-                inplace=True,
-            )
-
-            # Merge informative columns onto the base dataframe
-            columns = ["date", "cvd_1h", "cvd_1h_delta", "cvd_1h_delta_abs"]
-            dataframe = merge_informative_pair(
-                dataframe, informative[columns],
-                self.timeframe, self.informative_timeframe,
-                ffill=True,
-            )
-
+            informative = self.dp.get_pair_dataframe(pair, tf)
         except Exception as exc:
-            self.log.warning(f"CVD informative merge failed for {pair}: {exc}")
+            logger.debug("Could not fetch informative data for %s: %s", pair, exc)
+            return dataframe
+
+        if informative is None or informative.empty:
+            return dataframe
+
+        # --- Compute CVD on 1H ------------------------------------------
+        informative = informative.copy()
+        informative["cvd_raw_1h"] = (
+            (informative["close"] - informative["open"]) * informative["volume"]
+        )
+        informative["cvd_1h"] = informative["cvd_raw_1h"].cumsum()
+
+        # ΔCVD over a longer window on 1H (triple the base period)
+        p = self._params_for(pair)
+        delta_window = p["cvd_delta_period"] * 3
+        informative["cvd_1h_delta"] = informative["cvd_1h"].diff(delta_window)
+        informative["cvd_1h_delta_abs"] = informative["cvd_1h_delta"].abs()
+
+        # Keep only what we need + date for merge
+        keep_cols = ["date", "cvd_1h", "cvd_1h_delta", "cvd_1h_delta_abs"]
+
+        # Merge onto base dataframe
+        dataframe = merge_informative_pair(
+            dataframe, informative[keep_cols],
+            self.timeframe, tf,
+            ffill=True,
+        )
 
         return dataframe
-
-
-# ===================================================================
-# Required for Freqtrade discovery
-# ===================================================================
-try:
-    import freqtrade.vendor.qtpylib.indicators as qtpylib
-except ImportError:
-    qtpylib = None

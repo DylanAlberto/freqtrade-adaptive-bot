@@ -27,8 +27,9 @@ A production-grade algorithmic trading bot built on **Freqtrade** for Perpetual 
 
 | Profile | Regime | Logic |
 |---|---|---|
-| **High Liquid / Low Beta** (BTC) | Trend Following | Breakout mechanisms, wider ATR, longer CVD horizon |
+| **High Liquid / Low Beta** (BTC, ETH) | Trend Following | Breakout, wider ATR, longer CVD horizon |
 | **High Vol / Mid-Cap** (SOL, AVAX) | Mean Reversion | Shorter timeframes, reactive StochRSI, tighter ATR |
+| **Meme / Micro-Cap** (PEPE) | Mean Reversion | 1m base, very tight StochRSI, wide ATR buffer |
 
 ### Indicator Set (Non-Colinear)
 
@@ -47,71 +48,115 @@ A production-grade algorithmic trading bot built on **Freqtrade** for Perpetual 
 
 ```
 freqtrade-adaptive-bot/
-├── config.json                      # Exchange & runtime config
+├── config.json                      # Live / dry-run config
+├── config.backtest.json             # Backtest-specific config (5 pairs)
 ├── pair_params.default.json         # Default per-pair parameters (fallback)
+│
 ├── user_data/
 │   └── strategies/
-│       └── MultiPairAdaptiveStrategy.py   # Core strategy
+│       └── MultiPairAdaptiveStrategy.py   # Core strategy (v3 interface)
+│
 ├── scripts/
 │   ├── download_data.sh             # Historical data ingestion
+│   ├── run_backtest.sh              # Multi-mode backtest runner
+│   ├── backtest_sweep.sh            # Parameter sensitivity sweeps
 │   ├── run_hyperopt.sh              # Bayesian optimization runner
 │   └── deploy_params.sh             # Deploy hyperopt output → pair_params.json
+│
 ├── docs/
 │   └── architecture.md              # Full system design doc
+│
 └── README.md
 ```
 
 ---
 
-## Setup
+## Backtesting Workflow
 
-### Prerequisites
-
-- Python 3.10+
-- [Freqtrade](https://www.freqtrade.io/en/stable/) installed
-- Binance (or compatible exchange) account
-
-### Quick Start
+### 1. Download Historical Data
 
 ```bash
-# 1. Clone
-git clone https://github.com/DylanAlberto/freqtrade-adaptive-bot.git
-cd freqtrade-adaptive-bot
-
-# 2. Symlink strategy into your freqtrade user_data
-ln -s "$(pwd)/user_data/strategies" ~/freqtrade/user_data/strategies
-
-# 3. Download historical data
 bash scripts/download_data.sh
+```
 
-# 4. Run hyperopt (per pair recommendation)
+Downloads 180 days of futures data (1m, 5m, 15m, 1h) for all configured pairs.
+
+### 2. Run Backtest
+
+```bash
+# Quick check (last ~500 candles)
+MODE=quick bash scripts/run_backtest.sh
+
+# Monthly
+MODE=month bash scripts/run_backtest.sh
+
+# Full 180-day
+MODE=full bash scripts/run_backtest.sh
+
+# Custom date range
+MODE=range RANGE=20260101-20260607 bash scripts/run_backtest.sh
+```
+
+### 3. Parameter Sensitivity Sweep
+
+```bash
+bash scripts/backtest_sweep.sh
+```
+
+Tests variations of `max_open_trades` and `trailing_stop_positive` to measure sensitivity.
+
+### 4. Hyperopt (per-pair)
+
+```bash
+# Optimise all pairs
 bash scripts/run_hyperopt.sh
 
-# 5. Run live / dry-run
-freqtrade trade --config config.json --strategy MultiPairAdaptiveStrategy
+# Optimise a single pair
+PAIR=BTC/USDT:USDT bash scripts/run_hyperopt.sh
 ```
+
+### 5. Deploy Optimised Parameters
+
+```bash
+bash scripts/deploy_params.sh
+```
+
+Copies defaults → `pair_params.json`. Edit this file with your hyperopt results.
 
 ---
 
-## Hyperopt Workflow
+## Pairs Currently Configured
 
-```
-1. Data Ingestion      →  freqtrade download-data ...
-2. Bayesian Optim.     →  freqtrade hyperopt --epochs 500
-3. Deploy Params       →  Copy JSON results → pair_params.json
-4. Strategy loads      →  Reads pair_params.json at init
-```
-
-The Bayesian optimizer (via `scikit-optimize`) targets **Sharpe Ratio** / **Sortino Ratio** and writes optimal variables per asset into `pair_params.json`.
+| Pair | Timeframe | Profile | Stop ATR Mult |
+|---|---|---|---|
+| BTC/USDT:USDT | 15m | Trend | 1.5× |
+| ETH/USDT:USDT | 15m | Trend | 1.8× |
+| SOL/USDT:USDT | 5m | Mean Reversion | 2.3× |
+| AVAX/USDT:USDT | 5m | Mean Reversion | 2.5× |
+| PEPE/USDT:USDT | 1m | Mean Reversion | 3.1× |
 
 ---
 
 ## Risk Management
 
 - **Margin**: Isolated per position
-- **Stop Loss**: Dynamic ATR-based (per-pair optimized multiplier)
+- **Stop Loss**: Dynamic ATR-based (per-pair optimized multiplier, capped 15 %)
 - **Orders**: Limit entry/exit with order book pricing
-- **Trailing Stop**: Enabled globally, per-pair ATR distance
+- **Trailing Stop**: Enabled, activates after 1 % profit, trails at 0.5 %
+- **Max Open Trades**: 3 (configurable)
+
+---
+
+## Strategy Entry Logic Details
+
+| Regime | Direction | Condition |
+|---|---|---|
+| **Trend** | Long | StochRSI crosses above oversold + CVD delta > 0 |
+| **Trend** | Short | StochRSI crosses below overbought + CVD delta < 0 |
+| **Range** | Long | StochRSI crosses above oversold (mean reversion) |
+| **Range** | Short | StochRSI crosses below overbought (mean reversion) |
+
+Exit triggers: StochRSI reaches opposite extreme OR CVD-close divergence detected.
 
 ---
 

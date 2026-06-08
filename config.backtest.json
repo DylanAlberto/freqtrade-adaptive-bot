@@ -3,12 +3,12 @@
     "margin_mode": "isolated",
     "exchange": {
         "name": "binance",
-        "key": "your_api_key",
-        "secret": "your_api_secret",
+        "key": "",
+        "secret": "",
         "pair_whitelist": [
             "BTC/USDT:USDT",
-            "SOL/USDT:USDT",
             "ETH/USDT:USDT",
+            "SOL/USDT:USDT",
             "AVAX/USDT:USDT",
             "PEPE/USDT:USDT"
         ],
@@ -21,7 +21,7 @@
         "exit": "limit",
         "emergency_exit": "market",
         "stoploss": "market",
-        "stoploss_on_exchange": true
+        "stoploss_on_exchange": false
     },
     "entry_pricing": {
         "price_side": "bid",
@@ -31,9 +31,9 @@
         "price_side": "ask",
         "use_order_book": true
     },
-    "dry_run": true,
     "stake_currency": "USDT",
     "stake_amount": "unlimited",
+    "dry_run_wallet": 10000,
     "trailing_stop": true,
     "trailing_stop_positive": 0.005,
     "trailing_stop_positive_offset": 0.01,
@@ -47,14 +47,16 @@
     "exit_profit_only": false,
     "ignore_roi_if_entry_signal": false,
     "timeframe": "5m",
+    "timeframe_detail": "",
     "fiat_display_currency": "USD",
     "strategy": "MultiPairAdaptiveStrategy",
     "strategy_path": "user_data/strategies",
     "max_open_trades": 3,
-    "dry_run_wallet": 1000,
     "telegram": {
-        "enabled": false,
-        "chat_id": "",
-        "token": ""
-    }
+        "enabled": false
+    },
+    "db_url": "sqlite:///user_data/backtest_results/trades_backtest.sqlite",
+    "export": "signals",
+    "exportfilename": "user_data/backtest_results/backtest_result.json",
+    "disable_dataframe_checks": false
 }
