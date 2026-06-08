@@ -23,8 +23,12 @@
         ],
         "ccxt_config": {
             "enableRateLimit": true
-        }
+        },
+        "pair_blacklist": []
     },
+    "pairlists": [
+        {"method": "StaticPairList"}
+    ],
     "order_types": {
         "entry": "limit",
         "exit": "limit",
@@ -63,7 +67,7 @@
     "dry_run_wallet": 1000,
     "telegram": {
         "enabled": false,
-        "chat_id": "",
-        "token": ""
+        "token": "",
+        "chat_id": ""
     }
 }

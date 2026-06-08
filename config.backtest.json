@@ -23,8 +23,12 @@
         ],
         "ccxt_config": {
             "enableRateLimit": true
-        }
+        },
+        "pair_blacklist": []
     },
+    "pairlists": [
+        {"method": "StaticPairList"}
+    ],
     "order_types": {
         "entry": "limit",
         "exit": "limit",
@@ -62,10 +66,11 @@
     "strategy_path": "user_data/strategies",
     "max_open_trades": 3,
     "telegram": {
-        "enabled": false
+        "enabled": false,
+        "token": "",
+        "chat_id": ""
     },
     "db_url": "sqlite:///user_data/backtest_results/trades_backtest.sqlite",
     "export": "signals",
-    "exportfilename": "user_data/backtest_results/backtest_result.json",
     "disable_dataframe_checks": false
 }
