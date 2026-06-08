@@ -1,0 +1,28 @@
+{
+  "metadata": {
+    "description": "WLD-optimized parameters",
+    "source": "first backtest refinement",
+    "version": "1.0.0"
+  },
+  "WLD/USDT:USDT": {
+    "timeframe": "15m",
+    "informative_timeframe": "1h",
+    "regime": "mean_reversion",
+    "stochrsi": {
+      "period": 14,
+      "smooth_k": 3,
+      "smooth_d": 3,
+      "oversold": 25,
+      "overbought": 75
+    },
+    "cvd": {
+      "delta_period": 10,
+      "threshold": 0.22
+    },
+    "risk": {
+      "atr_multiplier_stop": 5.0,
+      "atr_multiplier_entry": 1.0,
+      "position_size_pct": 0.10
+    }
+  }
+}

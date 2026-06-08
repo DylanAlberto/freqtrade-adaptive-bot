@@ -107,9 +107,9 @@ def _load_pair_params(config: Dict[str, Any]) -> Dict[str, Any]:
 
 _DEFAULTS: Dict[str, Any] = {
     "stochrsi": {
-        "period": 10,
-        "smooth_k": 3,
-        "smooth_d": 3,
+        "fast_period": 7,
+        "slow_period": 21,
+        "smooth": 3,
         "oversold": 20,
         "overbought": 80,
     },
@@ -143,19 +143,48 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
     can_short = True
 
-    # These are overridden per-pair at runtime once we know the pair's
-    # dedicated timeframe. Keep 5m as the default for startup.
-    timeframe: str = "5m"
+    # WLD/USDT focused: 15m base, 1h informative
+    timeframe: str = "15m"
     informative_timeframe: str = "1h"
 
     # Hard stoploss fallback — overridden dynamically by custom_stoploss()
     stoploss = -0.05
 
+    # Explicitly enable custom_stoploss (required for ATR dynamic stops)
+    use_custom_stoploss = True
+
+    # Enable position adjustment for partial exits
+    position_adjustment_enable = True
+
     # ROI table disabled (exit is signal-based)
     minimal_roi = {"0": 100.0}
 
     # Warmup candles needed for all indicators
-    startup_candle_count: int = 100
+    startup_candle_count: int = 200
+
+    # --- Freqtrade Protections (Global Loss Shield + Cooldown) --------
+    @property
+    def protections(self):
+        return [
+            {
+                "method": "MaxDrawdown",
+                "lookback_period_candles": 96,        # 24h en 15m
+                "trade_limit": 1,
+                "stop_duration_candles": 96,
+                "max_allowed_drawdown": 0.05,          # 5% diario
+            },
+            {
+                "method": "CooldownPeriod",
+                "stop_duration_candles": 1,            # 15min post-trade
+            },
+            {
+                "method": "StoplossGuard",
+                "lookback_period_candles": 48,         # 12h
+                "stop_duration_candles": 48,
+                "trade_limit": 3,
+                "only_per_pair": True,
+            },
+        ]
 
     # --- Hyperopt spaces (fallback when pair_params.json absent) ------
     stochrsi_period      = IntParameter(5, 25, default=10, space="buy")
@@ -174,6 +203,9 @@ class MultiPairAdaptiveStrategy(IStrategy):
         # Load per-pair parameters
         self.pair_params: Dict[str, Any] = _load_pair_params(config)
 
+        # Track which trades have done a 50% partial exit
+        self._partial_exits: set = set()
+
         # Cache resolved params per pair
         self._params_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -182,23 +214,50 @@ class MultiPairAdaptiveStrategy(IStrategy):
     # ------------------------------------------------------------------
 
     def _params_for(self, pair: str) -> Dict[str, Any]:
-        """Return the resolved parameter dict for *pair* (cached)."""
+        """Return the resolved parameter dict for *pair* (cached).
+
+        Priority:
+          1. pair_params.json entry for this pair
+          2. Hyperopt parameters (IntParameter / DecimalParameter values)
+          3. Hardcoded _DEFAULTS
+        """
         if pair in self._params_cache:
             return self._params_cache[pair]
 
-        params = self.pair_params.get(pair, _DEFAULTS)
+        params = self.pair_params.get(pair, None)
 
-        resolved = {
-            "stochrsi_period":      int(params["stochrsi"]["period"]),
-            "stochrsi_smooth_k":    int(params["stochrsi"]["smooth_k"]),
-            "stochrsi_smooth_d":    int(params["stochrsi"]["smooth_d"]),
-            "stochrsi_oversold":    float(params["stochrsi"]["oversold"]),
-            "stochrsi_overbought":  float(params["stochrsi"]["overbought"]),
-            "cvd_delta_period":     int(params["cvd"]["delta_period"]),
-            "cvd_threshold":        float(params["cvd"]["threshold"]),
-            "atr_multiplier_stop":  float(params["risk"]["atr_multiplier_stop"]),
-            "atr_multiplier_entry": float(params["risk"]["atr_multiplier_entry"]),
-        }
+        if params is not None:
+            # Use pair_params.json values
+            resolved = {
+                "stochrsi_fast_period":  int(params["stochrsi"]["fast_period"]),
+                "stochrsi_slow_period":  int(params["stochrsi"]["slow_period"]),
+                "stochrsi_smooth":       int(params["stochrsi"].get("smooth", 3)),
+                "stochrsi_oversold":     float(params["stochrsi"]["oversold"]),
+                "stochrsi_overbought":   float(params["stochrsi"]["overbought"]),
+                "cvd_delta_period":     int(params["cvd"]["delta_period"]),
+                "cvd_threshold":        float(params["cvd"]["threshold"]),
+                "atr_multiplier_stop":  float(params["risk"]["atr_multiplier_stop"]),
+                "atr_multiplier_entry": float(params["risk"]["atr_multiplier_entry"]),
+                "atr_multiplier_tp":    float(params["risk"].get("atr_multiplier_tp", 4.0)),
+                "position_size_pct":    float(params["risk"].get("position_size_pct", 0.10)),
+                "max_trade_minutes":    int(params["risk"].get("max_trade_minutes", 240)),
+            }
+        else:
+            # Use hyperopt-testable parameters (falls back to defaults)
+            resolved = {
+                "stochrsi_fast_period":  7,
+                "stochrsi_slow_period":  21,
+                "stochrsi_smooth":       3,
+                "stochrsi_oversold":     float(self.stochrsi_oversold.value),
+                "stochrsi_overbought":   float(self.stochrsi_overbought.value),
+                "cvd_delta_period":     10,
+                "cvd_threshold":        self.cvd_threshold.value,
+                "atr_multiplier_stop":  self.atr_stop_mult.value,
+                "atr_multiplier_entry": 1.0,
+                "atr_multiplier_tp":    4.0,
+                "position_size_pct":    0.10,
+                "max_trade_minutes":    240,
+            }
 
         self._params_cache[pair] = resolved
         return resolved
@@ -226,10 +285,21 @@ class MultiPairAdaptiveStrategy(IStrategy):
         # --- 2. Stochastic RSI ------------------------------------------
         self._populate_stochrsi(dataframe, p)
 
-        # --- 3. ATR -----------------------------------------------------
+        # --- 3. ATR + Volatility Shield ------------------------------
         import talib.abstract as ta
-        atr_period = max(p["stochrsi_period"], 14)
+        atr_period = max(p["stochrsi_fast_period"], 14)
         dataframe["atr"] = ta.ATR(dataframe, timeperiod=atr_period)
+
+        # ATR moving average (20 periods) — baseline para el shield
+        dataframe["atr_ma"] = ta.SMA(dataframe["atr"], timeperiod=20)
+
+        # ATR ratio: cuánto se desvía el ATR actual de su media
+        # > 1.0 → volatilidad por encima de lo normal
+        dataframe["atr_ratio"] = dataframe["atr"] / dataframe["atr_ma"]
+
+        # Volatility Shield: no operar cuando ATR supera 1.5× su media
+        # (movimientos caóticos / manipulación)
+        dataframe["volatility_shield"] = (dataframe["atr_ratio"] < 1.5).astype(int)
 
         # --- 4. CVD rate-of-change on base TF (regime helper) -----------
         dataframe["cvd_delta"]    = dataframe["cvd"].diff(p["cvd_delta_period"])
@@ -249,8 +319,24 @@ class MultiPairAdaptiveStrategy(IStrategy):
         ).astype(int)
 
         # --- 6. Informative (1H) CVD for regime filter ------------------
-        # This merges CVD columns from the 1H timeframe onto the base df.
         dataframe = self._attach_informative_cvd(dataframe, metadata)
+
+        # --- 7. Open Interest (OI) — institutional flow filter ---------
+        # Graceful fallback if OI data not available (backtesting)
+        dataframe["oi_confirmed"] = 1  # default: allow
+        try:
+            oi_df = self.dp.get_pair_dataframe(pair, "15m")
+            if oi_df is not None and not oi_df.empty and "open_interest" in oi_df.columns:
+                oi_change = oi_df["open_interest"].diff(4)  # 1h change
+                # OI increasing + price up + CVD up = institutional accumulation
+                # OI decreasing + price up + CVD down = short squeeze (weak)
+                dataframe["oi_change"] = oi_change
+                dataframe["oi_confirmed"] = (
+                    (dataframe["cvd_delta"] > 0) & (oi_change > 0) |
+                    (dataframe["cvd_delta"] < 0) & (oi_change < 0)
+                ).astype(int)
+        except Exception:
+            pass  # OI not available, use oi_confirmed=1 (allow all)
 
         return dataframe
 
@@ -268,36 +354,56 @@ class MultiPairAdaptiveStrategy(IStrategy):
         # --- Trend Regime -----------------------------------------------
         trend_mask = dataframe["regime_trend"] == 1
 
-        # LONG: StochRSI_k crosses above oversold + CVD delta positive
+        # LONG: StochRSI_fast crosses above oversold + CVD delta positive
+        #       + StochRSI_slow > 50 (medium-term bullish filter)
+        #       + Volatility Shield active
+        #       + OI confirms institutional flow
         dataframe.loc[
             trend_mask &
-            crossed_above(dataframe["stochrsi_k"], p["stochrsi_oversold"]) &
-            (dataframe["cvd_delta"] > 0),
+            crossed_above(dataframe["stochrsi_k_fast"], p["stochrsi_oversold"]) &
+            (dataframe["cvd_delta"] > 0) &
+            (dataframe["stochrsi_k_slow"] > 50) &
+            (dataframe["volatility_shield"] == 1) &
+            (dataframe["oi_confirmed"] == 1),
             "enter_long",
         ] = 1
 
-        # SHORT: StochRSI_k crosses below overbought + CVD delta negative
+        # SHORT: StochRSI_fast crosses below overbought + CVD delta negative
+        #        + StochRSI_slow < 50 (medium-term bearish filter)
+        #        + Volatility Shield active
+        #        + OI confirms institutional flow
         dataframe.loc[
             trend_mask &
-            crossed_below(dataframe["stochrsi_k"], p["stochrsi_overbought"]) &
-            (dataframe["cvd_delta"] < 0),
+            crossed_below(dataframe["stochrsi_k_fast"], p["stochrsi_overbought"]) &
+            (dataframe["cvd_delta"] < 0) &
+            (dataframe["stochrsi_k_slow"] < 50) &
+            (dataframe["volatility_shield"] == 1) &
+            (dataframe["oi_confirmed"] == 1),
             "enter_short",
         ] = 1
 
         # --- Range Regime -----------------------------------------------
         range_mask = dataframe["regime_trend"] == 0
 
-        # LONG: oversold bounce
+        # LONG: StochRSI_fast oversold bounce + StochRSI_slow bullish
+        #       + Volatility Shield + OI confirmation
         dataframe.loc[
             range_mask &
-            crossed_above(dataframe["stochrsi_k"], p["stochrsi_oversold"]),
+            crossed_above(dataframe["stochrsi_k_fast"], p["stochrsi_oversold"]) &
+            (dataframe["stochrsi_k_slow"] > 50) &
+            (dataframe["volatility_shield"] == 1) &
+            (dataframe["oi_confirmed"] == 1),
             "enter_long",
         ] = 1
 
-        # SHORT: overbought rejection
+        # SHORT: StochRSI_fast overbought rejection + StochRSI_slow bearish
+        #        + Volatility Shield + OI confirmation
         dataframe.loc[
             range_mask &
-            crossed_below(dataframe["stochrsi_k"], p["stochrsi_overbought"]),
+            crossed_below(dataframe["stochrsi_k_fast"], p["stochrsi_overbought"]) &
+            (dataframe["stochrsi_k_slow"] < 50) &
+            (dataframe["volatility_shield"] == 1) &
+            (dataframe["oi_confirmed"] == 1),
             "enter_short",
         ] = 1
 
@@ -314,16 +420,18 @@ class MultiPairAdaptiveStrategy(IStrategy):
         dataframe.loc[:, "exit_long"]  = 0
         dataframe.loc[:, "exit_short"] = 0
 
-        # Exit LONG: StochRSI reaches overbought OR bearish CVD divergence
+        # Exit LONG: Fast StochRSI crosses BACK below overbought
+        #             OR bearish CVD divergence
         dataframe.loc[
-            (dataframe["stochrsi_k"] >= p["stochrsi_overbought"]) |
+            crossed_below(dataframe["stochrsi_k_fast"], p["stochrsi_overbought"]) |
             (dataframe["cvd_div_neg"] == 1),
             "exit_long",
         ] = 1
 
-        # Exit SHORT: StochRSI reaches oversold OR bullish CVD divergence
+        # Exit SHORT: Fast StochRSI crosses BACK above oversold
+        #             OR bullish CVD divergence
         dataframe.loc[
-            (dataframe["stochrsi_k"] <= p["stochrsi_oversold"]) |
+            crossed_above(dataframe["stochrsi_k_fast"], p["stochrsi_oversold"]) |
             (dataframe["cvd_div_pos"] == 1),
             "exit_short",
         ] = 1
@@ -361,34 +469,214 @@ class MultiPairAdaptiveStrategy(IStrategy):
         if atr is None or np.isnan(atr) or atr == 0:
             return self.stoploss
 
-        # Dynamic stop = ATR * multiplier, as fraction of entry price
-        atr_stop_pct = (atr * p["atr_multiplier_stop"]) / trade.open_rate
-        return -min(atr_stop_pct, 0.15)  # cap at 15%
+        # --- ATR-based trailing stop ---
+        # stop = current_price - (ATR * multiplier)
+        # As price rises, stop trails up automatically
+        # As volatility expands/contracts, stop widens/tightens dynamically
+        stop_price = current_rate - (atr * p["atr_multiplier_stop"])
+
+        # Convert to Freqtrade's open_rate-relative format
+        stoploss_rel = (stop_price - trade.open_rate) / trade.open_rate
+
+        # Cap at 15% max loss from entry
+        return max(stoploss_rel, -0.15)
+
+    # ------------------------------------------------------------------
+    # Partial exit at 1:1 R:R + trailing the rest (Positive Asymmetry)
+    # ------------------------------------------------------------------
+
+    def adjust_trade_position(
+        self,
+        trade: Trade,
+        current_time: pd.Timestamp,
+        current_rate: float,
+        current_profit: float,
+        min_stake: Optional[float],
+        max_stake: float,
+        current_entry_rate: float,
+        current_exit_rate: float,
+        **kwargs,
+    ) -> Optional[float]:
+        """
+        Sell 50% of position at 1:1 risk/reward.
+        Remaining 50% runs until take_profit or exit_signal.
+        """
+        if current_profit < 0:
+            return None  # not profitable yet
+
+        # Track which trades already did the 50% exit
+        partial_key = f"partial_{trade.id}"
+        if partial_key in self._partial_exits:
+            return None  # already reduced
+
+        p = self._params_for(trade.pair)
+
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(trade.pair, self.timeframe)
+            if dataframe is None or dataframe.empty:
+                return None
+            atr = dataframe.iloc[-1].get("atr")
+        except Exception:
+            return None
+
+        if atr is None or np.isnan(atr) or atr == 0:
+            return None
+
+        # 1:1 R:R level = initial stop distance
+        stop_distance = (atr * p["atr_multiplier_stop"]) / trade.open_rate
+
+        if current_profit > stop_distance:
+            # Sell 50% — negative amount reduces position
+            self._partial_exits.add(partial_key)
+            logger.info(
+                f"Partial exit 50% at {current_profit:.2%} profit for {trade.pair}"
+            )
+            return -(trade.stake_amount / 2)
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Multi-stage exits: 1:1 partial, take-profit, time-based
+    # ------------------------------------------------------------------
+
+    def custom_exit(
+        self,
+        pair: str,
+        trade: Trade,
+        current_time: pd.Timestamp,
+        current_rate: float,
+        current_profit: float,
+        **kwargs,
+    ) -> Optional[str]:
+        """
+        Stage 2 exit: ATR take-profit + Time-Based Exit for remaining 50%.
+        Stage 1 (50% at 1:1) is handled by adjust_trade_position().
+        """
+        p = self._params_for(pair)
+        tp_mult = p.get("atr_multiplier_tp", 4.0)
+        max_minutes = p.get("max_trade_minutes", 240)
+
+        # --- Time-Based Exit: kill zombie trades -----------------------
+        trade_minutes = (current_time - trade.open_date_utc).total_seconds() / 60
+        if trade_minutes > max_minutes:
+            return "time_exit"
+
+        # --- ATR-based take profit for remaining 50% -------------------
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if dataframe is None or dataframe.empty:
+                return None
+            atr = dataframe.iloc[-1].get("atr")
+        except Exception:
+            return None
+
+        if atr is None or np.isnan(atr) or atr == 0:
+            return None
+
+        tp_target = (atr * tp_mult) / trade.open_rate
+        if current_profit > tp_target:
+            return "take_profit"
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Kelly-informed position sizing — risk a fixed % of wallet per trade
+    # ------------------------------------------------------------------
+
+    def custom_stake_amount(
+        self,
+        pair: str,
+        current_time: pd.Timestamp,
+        current_rate: float,
+        proposed_stake: float,
+        min_stake: float,
+        max_stake: float,
+        entry_tag: Optional[str],
+        side: str,
+        **kwargs,
+    ) -> float:
+        """
+        Z-Score modulated position sizing (Half-Kelly 2%-6%).
+
+        Base: 5% of wallet (Half-Kelly).
+        Modulation: ATR Z-Score + signal confluence.
+        - ATR anómalo (> 1.5× media) → 2% (mínimo)
+        - ATR normal (0.8-1.2× media) → 5% (base)
+        - ATR comprimido (< 0.8× media) → 6% (máximo — calma = señal fiable)
+        """
+        p = self._params_for(pair)
+        base_pct = p.get("position_size_pct", 0.05)
+
+        # --- Z-Score modulation via ATR ratio --------------------------
+        try:
+            dataframe, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            if dataframe is not None and not dataframe.empty:
+                atr_ratio = dataframe.iloc[-1].get("atr_ratio", 1.0)
+            else:
+                atr_ratio = 1.0
+        except Exception:
+            atr_ratio = 1.0
+
+        atr_ratio = atr_ratio if atr_ratio > 0 else 1.0
+
+        # Z-Score inspired bands (ATR ratio is a proxy for Z-Score)
+        if atr_ratio < 0.8:
+            mult = 1.2    # 6% — calma, señal fiable
+        elif atr_ratio < 1.0:
+            mult = 1.0    # 5% — normal
+        elif atr_ratio < 1.2:
+            mult = 0.8    # 4% — ligeramente volátil
+        elif atr_ratio < 1.5:
+            mult = 0.6    # 3% — volátil
+        else:
+            mult = 0.4    # 2% — shield activo, mínimo riesgo
+
+        pct = base_pct * mult
+        pct = max(0.02, min(0.06, pct))  # clamp 2%-6%
+
+        wallet = self.wallets.get_total_stake_amount()
+        stake = wallet * pct
+
+        return max(min(stake, max_stake), min_stake)
 
     # ================================================================
     # Private helpers
     # ================================================================
 
     def _populate_stochrsi(self, dataframe: DataFrame, p: Dict[str, Any]) -> None:
-        """Add StochRSI %K and %D columns."""
+        """Add fast and slow StochRSI columns.
+
+        Fast  → trigger (short-period, sensitive)
+        Slow  → filter (long-period, trend bias)
+        """
         import talib.abstract as ta
 
-        rsi = ta.RSI(dataframe, timeperiod=p["stochrsi_period"])
+        rsi_fast = ta.RSI(dataframe, timeperiod=p["stochrsi_fast_period"])
+        rsi_slow = ta.RSI(dataframe, timeperiod=p["stochrsi_slow_period"])
 
-        # STOCHF (Fast Stochastic) of RSI
-        stoch = ta.STOCHF(
-            pd.DataFrame({
-                "high":  rsi,
-                "low":   rsi,
-                "close": rsi,
-            }),
-            fastk_period=p["stochrsi_period"],
-            fastd_period=p["stochrsi_smooth_d"],
+        smooth = p["stochrsi_smooth"]
+
+        # Fast StochRSI (%K) — entry trigger
+        fast_stoch = ta.STOCHF(
+            pd.DataFrame({"high": rsi_fast, "low": rsi_fast, "close": rsi_fast}),
+            fastk_period=p["stochrsi_fast_period"],
+            fastd_period=smooth,
             fastk_matype=0,
             fastd_matype=0,
         )
-        dataframe["stochrsi_k"] = stoch["fastk"]
-        dataframe["stochrsi_d"] = stoch["fastd"]
+        dataframe["stochrsi_k_fast"] = fast_stoch["fastk"]
+        dataframe["stochrsi_d_fast"] = fast_stoch["fastd"]
+
+        # Slow StochRSI (%K) — trend filter (>50 bullish, <50 bearish)
+        slow_stoch = ta.STOCHF(
+            pd.DataFrame({"high": rsi_slow, "low": rsi_slow, "close": rsi_slow}),
+            fastk_period=p["stochrsi_slow_period"],
+            fastd_period=smooth,
+            fastk_matype=0,
+            fastd_matype=0,
+        )
+        dataframe["stochrsi_k_slow"] = slow_stoch["fastk"]
+        dataframe["stochrsi_d_slow"] = slow_stoch["fastd"]
 
     def _attach_informative_cvd(
         self,
