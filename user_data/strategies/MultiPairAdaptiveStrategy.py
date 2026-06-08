@@ -268,7 +268,9 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
     def informative_pairs(self) -> list:
         pairs = self.config["exchange"]["pair_whitelist"]
-        return [(pair, self.informative_timeframe) for pair in pairs]
+        # Register 1h (for CVD regime) and 4h (for EMA50 trend filter)
+        return ([(pair, self.informative_timeframe) for pair in pairs] +
+                [(pair, "4h") for pair in pairs])
 
     # ------------------------------------------------------------------
     # Indicator population
@@ -322,21 +324,40 @@ class MultiPairAdaptiveStrategy(IStrategy):
         dataframe = self._attach_informative_cvd(dataframe, metadata)
 
         # --- 7. Open Interest (OI) — institutional flow filter ---------
-        # Graceful fallback if OI data not available (backtesting)
-        dataframe["oi_confirmed"] = 1  # default: allow
+        dataframe["oi_confirmed"] = 1
         try:
             oi_df = self.dp.get_pair_dataframe(pair, "15m")
             if oi_df is not None and not oi_df.empty and "open_interest" in oi_df.columns:
-                oi_change = oi_df["open_interest"].diff(4)  # 1h change
-                # OI increasing + price up + CVD up = institutional accumulation
-                # OI decreasing + price up + CVD down = short squeeze (weak)
+                oi_change = oi_df["open_interest"].diff(4)
                 dataframe["oi_change"] = oi_change
                 dataframe["oi_confirmed"] = (
                     (dataframe["cvd_delta"] > 0) & (oi_change > 0) |
                     (dataframe["cvd_delta"] < 0) & (oi_change < 0)
                 ).astype(int)
         except Exception:
-            pass  # OI not available, use oi_confirmed=1 (allow all)
+            pass
+
+        # --- 8. EMA 50 en 4H — interruptor direccional estructural ------
+        # Si precio < EMA50(4h) → solo SHORT
+        # Si precio > EMA50(4h) → solo LONG
+        try:
+            df_4h = self.dp.get_pair_dataframe(pair, "4h")
+            if df_4h is not None and not df_4h.empty:
+                import talib.abstract as ta
+                df_4h["ema50"] = ta.EMA(df_4h["close"], timeperiod=50)
+                # Merge la EMA 50 al dataframe base
+                dataframe = merge_informative_pair(
+                    dataframe, df_4h[["date", "ema50"]],
+                    self.timeframe, "4h", ffill=True,
+                )
+                # Dirección: 1 = LONG only, 0 = SHORT only
+                dataframe["ema50_direction"] = (
+                    dataframe["close"] > dataframe["ema50"]
+                ).astype(int)
+            else:
+                dataframe["ema50_direction"] = 1  # fallback: permitir ambos
+        except Exception:
+            dataframe["ema50_direction"] = 1
 
         return dataframe
 
@@ -356,29 +377,28 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
         # LONG: StochRSI_fast crosses above oversold + CVD delta positive
         #       + StochRSI_slow > 50 (medium-term bullish filter)
-        #       + Volatility Shield active
-        #       + OI confirms institutional flow
+        #       + Volatility Shield + OI + EMA50(4H) trending UP → LONG only
         dataframe.loc[
             trend_mask &
             crossed_above(dataframe["stochrsi_k_fast"], p["stochrsi_oversold"]) &
             (dataframe["cvd_delta"] > 0) &
             (dataframe["stochrsi_k_slow"] > 50) &
             (dataframe["volatility_shield"] == 1) &
-            (dataframe["oi_confirmed"] == 1),
+            (dataframe["oi_confirmed"] == 1) &
+            (dataframe["ema50_direction"] == 1),
             "enter_long",
         ] = 1
 
         # SHORT: StochRSI_fast crosses below overbought + CVD delta negative
-        #        + StochRSI_slow < 50 (medium-term bearish filter)
-        #        + Volatility Shield active
-        #        + OI confirms institutional flow
+        #        + StochRSI_slow < 50 + EMA50(4H) trending DOWN → SHORT only
         dataframe.loc[
             trend_mask &
             crossed_below(dataframe["stochrsi_k_fast"], p["stochrsi_overbought"]) &
             (dataframe["cvd_delta"] < 0) &
             (dataframe["stochrsi_k_slow"] < 50) &
             (dataframe["volatility_shield"] == 1) &
-            (dataframe["oi_confirmed"] == 1),
+            (dataframe["oi_confirmed"] == 1) &
+            (dataframe["ema50_direction"] == 0),
             "enter_short",
         ] = 1
 
@@ -386,24 +406,26 @@ class MultiPairAdaptiveStrategy(IStrategy):
         range_mask = dataframe["regime_trend"] == 0
 
         # LONG: StochRSI_fast oversold bounce + StochRSI_slow bullish
-        #       + Volatility Shield + OI confirmation
+        #       + Volatility + OI + EMA50 UP
         dataframe.loc[
             range_mask &
             crossed_above(dataframe["stochrsi_k_fast"], p["stochrsi_oversold"]) &
             (dataframe["stochrsi_k_slow"] > 50) &
             (dataframe["volatility_shield"] == 1) &
-            (dataframe["oi_confirmed"] == 1),
+            (dataframe["oi_confirmed"] == 1) &
+            (dataframe["ema50_direction"] == 1),
             "enter_long",
         ] = 1
 
         # SHORT: StochRSI_fast overbought rejection + StochRSI_slow bearish
-        #        + Volatility Shield + OI confirmation
+        #        + Volatility + OI + EMA50 DOWN
         dataframe.loc[
             range_mask &
             crossed_below(dataframe["stochrsi_k_fast"], p["stochrsi_overbought"]) &
             (dataframe["stochrsi_k_slow"] < 50) &
             (dataframe["volatility_shield"] == 1) &
-            (dataframe["oi_confirmed"] == 1),
+            (dataframe["oi_confirmed"] == 1) &
+            (dataframe["ema50_direction"] == 0),
             "enter_short",
         ] = 1
 
