@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Freqtrade
+user_data/data/
+user_data/backtest_results/
+user_data/plot/
+user_data/notebooks/
+user_data/logs/
+pair_params.json
+*.db
+
+# Environment & secrets
+.env
+*.key
+*_secret*
+config.local.json
+
+# Marketplace / Lock files
+*.lock
+*.pid
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

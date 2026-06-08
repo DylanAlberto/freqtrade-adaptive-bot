@@ -1,0 +1,70 @@
+{
+  "metadata": {
+    "description": "Default per-pair parameters. Copy to pair_params.json after hyperopt run.",
+    "source": "hand-tuned defaults",
+    "version": "1.0.0"
+  },
+  "BTC/USDT:USDT": {
+    "timeframe": "15m",
+    "informative_timeframe": "1h",
+    "regime": "trend",
+    "stochrsi": {
+      "period": 9,
+      "smooth_k": 3,
+      "smooth_d": 3,
+      "oversold": 20,
+      "overbought": 80
+    },
+    "cvd": {
+      "delta_period": 12,
+      "threshold": 0.15
+    },
+    "risk": {
+      "atr_multiplier_stop": 1.5,
+      "atr_multiplier_entry": 0.8,
+      "position_size_pct": 0.15
+    }
+  },
+  "SOL/USDT:USDT": {
+    "timeframe": "5m",
+    "informative_timeframe": "1h",
+    "regime": "mean_reversion",
+    "stochrsi": {
+      "period": 14,
+      "smooth_k": 3,
+      "smooth_d": 3,
+      "oversold": 25,
+      "overbought": 75
+    },
+    "cvd": {
+      "delta_period": 8,
+      "threshold": 0.25
+    },
+    "risk": {
+      "atr_multiplier_stop": 2.3,
+      "atr_multiplier_entry": 1.2,
+      "position_size_pct": 0.10
+    }
+  },
+  "ETH/USDT:USDT": {
+    "timeframe": "15m",
+    "informative_timeframe": "1h",
+    "regime": "trend",
+    "stochrsi": {
+      "period": 10,
+      "smooth_k": 3,
+      "smooth_d": 3,
+      "oversold": 20,
+      "overbought": 80
+    },
+    "cvd": {
+      "delta_period": 10,
+      "threshold": 0.18
+    },
+    "risk": {
+      "atr_multiplier_stop": 1.8,
+      "atr_multiplier_entry": 1.0,
+      "position_size_pct": 0.12
+    }
+  }
+}

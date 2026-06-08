@@ -1,0 +1,58 @@
+{
+    "trading_mode": "futures",
+    "margin_mode": "isolated",
+    "exchange": {
+        "name": "binance",
+        "key": "your_api_key",
+        "secret": "your_api_secret",
+        "pair_whitelist": [
+            "BTC/USDT:USDT",
+            "SOL/USDT:USDT",
+            "ETH/USDT:USDT"
+        ],
+        "ccxt_config": {
+            "enableRateLimit": true
+        }
+    },
+    "order_types": {
+        "entry": "limit",
+        "exit": "limit",
+        "emergency_exit": "market",
+        "stoploss": "market",
+        "stoploss_on_exchange": true
+    },
+    "entry_pricing": {
+        "price_side": "bid",
+        "use_order_book": true
+    },
+    "exit_pricing": {
+        "price_side": "ask",
+        "use_order_book": true
+    },
+    "dry_run": true,
+    "stake_currency": "USDT",
+    "stake_amount": "unlimited",
+    "trailing_stop": true,
+    "trailing_stop_positive": 0.005,
+    "trailing_stop_positive_offset": 0.01,
+    "trailing_only_offset_is_reached": true,
+    "unfilledtimeout": {
+        "entry": 30,
+        "exit": 10,
+        "exit_timeout_count": 3
+    },
+    "use_exit_signal": true,
+    "exit_profit_only": false,
+    "ignore_roi_if_entry_signal": false,
+    "timeframe": "5m",
+    "fiat_display_currency": "USD",
+    "strategy": "MultiPairAdaptiveStrategy",
+    "strategy_path": "user_data/strategies",
+    "max_open_trades": 3,
+    "dry_run_wallet": 1000,
+    "telegram": {
+        "enabled": false,
+        "chat_id": "",
+        "token": ""
+    }
+}
