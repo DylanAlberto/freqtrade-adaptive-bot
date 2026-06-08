@@ -131,8 +131,17 @@ Copies defaults → `pair_params.json`. Edit this file with your hyperopt result
 |---|---|---|---|
 | BTC/USDT:USDT | 15m | Trend | 1.5× |
 | ETH/USDT:USDT | 15m | Trend | 1.8× |
+| DASH/USDT:USDT | 15m | Trend | 1.8× |
 | SOL/USDT:USDT | 5m | Mean Reversion | 2.3× |
 | AVAX/USDT:USDT | 5m | Mean Reversion | 2.5× |
+| WLD/USDT:USDT | 5m | Mean Reversion | 2.0× |
+| ZEC/USDT:USDT | 5m | Mean Reversion | 2.0× |
+| TAO/USDT:USDT | 5m | Mean Reversion | 2.2× |
+| IP/USDT:USDT | 5m | Mean Reversion | 2.0× |
+| VIRTUAL/USDT:USDT | 5m | Mean Reversion | 2.5× |
+| ARC/USDT:USDT | 5m | Mean Reversion | 2.5× |
+| ASTER/USDT:USDT | 5m | Mean Reversion | 2.5× |
+| PENGU/USDT:USDT | 3m | Mean Reversion | 3.0× |
 | PEPE/USDT:USDT | 1m | Mean Reversion | 3.1× |
 
 ---

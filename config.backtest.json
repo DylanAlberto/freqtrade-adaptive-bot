@@ -10,7 +10,16 @@
             "ETH/USDT:USDT",
             "SOL/USDT:USDT",
             "AVAX/USDT:USDT",
-            "PEPE/USDT:USDT"
+            "PEPE/USDT:USDT",
+            "TAO/USDT:USDT",
+            "VIRTUAL/USDT:USDT",
+            "ARC/USDT:USDT",
+            "PENGU/USDT:USDT",
+            "IP/USDT:USDT",
+            "ASTER/USDT:USDT",
+            "WLD/USDT:USDT",
+            "ZEC/USDT:USDT",
+            "DASH/USDT:USDT"
         ],
         "ccxt_config": {
             "enableRateLimit": true
