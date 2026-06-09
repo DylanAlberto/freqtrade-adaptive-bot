@@ -5,7 +5,7 @@
         "name": "binance",
         "key": "",
         "secret": "",
-        "pair_whitelist": ["WLD/USDT:USDT", "ARC/USDT:USDT"],
+        "pair_whitelist": ["ARC/USDT:USDT"],
         "ccxt_config": {
             "enableRateLimit": true,
             "options": {
@@ -74,7 +74,6 @@
         "token": "",
         "chat_id": ""
     },
-    "db_url": "sqlite:///user_data/backtest_results/trades_wld.sqlite",
     "export": "trades",
     "disable_dataframe_checks": false
 }

@@ -1,0 +1,33 @@
+{
+  "strategy_name": "MultiPairAdaptiveStrategy",
+  "params": {
+    "roi": {
+      "0": 100.0
+    },
+    "stoploss": {
+      "stoploss": -0.05
+    },
+    "trailing": {
+      "trailing_stop": true,
+      "trailing_stop_positive": null,
+      "trailing_stop_positive_offset": 0.0,
+      "trailing_only_offset_is_reached": false
+    },
+    "max_open_trades": {
+      "max_open_trades": 1
+    },
+    "buy": {
+      "cvd_threshold": 0.366,
+      "stochrsi_oversold": 33,
+      "stochrsi_period": 6
+    },
+    "sell": {
+      "atr_stop_mult": 3.113,
+      "atr_trail_offset": 2.45,
+      "max_trade_minutes_p": 191,
+      "stochrsi_overbought": 85
+    }
+  },
+  "ft_stratparam_v": 1,
+  "export_time": "2026-06-08 18:52:23.032795+00:00"
+}

@@ -192,6 +192,9 @@ class MultiPairAdaptiveStrategy(IStrategy):
     stochrsi_overbought  = IntParameter(65, 90, default=80, space="sell")
     cvd_threshold        = DecimalParameter(0.05, 0.50, default=0.20, space="buy")
     atr_stop_mult        = DecimalParameter(1.0, 4.0, default=2.0, space="sell")
+    # V24: parámetros Hyperopt para salidas — optimización 100% matemática
+    atr_trail_offset     = DecimalParameter(1.0, 3.0, default=2.0, space="sell")
+    max_trade_minutes_p  = IntParameter(120, 480, default=240, space="sell")
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -203,7 +206,10 @@ class MultiPairAdaptiveStrategy(IStrategy):
         # Load per-pair parameters
         self.pair_params: Dict[str, Any] = _load_pair_params(config)
 
-        # Track which trades have done a 50% partial exit
+        # Track which trades have done a 50% partial exit (set of trade IDs)
+        # Track which trades have done a 50% partial exit (set of trade IDs)
+        self._partial_exits: set = set()
+
         # Cache resolved params per pair
         self._params_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -225,21 +231,24 @@ class MultiPairAdaptiveStrategy(IStrategy):
         params = self.pair_params.get(pair, None)
 
         if params is not None:
-            # Use pair_params.json values
+            # Use pair_params.json values (with graceful fallbacks)
+            stoch = params.get("stochrsi", {})
+            cvd   = params.get("cvd", {})
+            risk  = params.get("risk", {})
             resolved = {
-                "stochrsi_fast_period":  int(params["stochrsi"]["fast_period"]),
-                "stochrsi_slow_period":  int(params["stochrsi"]["slow_period"]),
-                "stochrsi_smooth":       int(params["stochrsi"].get("smooth", 3)),
-                "stochrsi_oversold":     float(params["stochrsi"]["oversold"]),
-                "stochrsi_overbought":   float(params["stochrsi"]["overbought"]),
-                "cvd_delta_period":     int(params["cvd"]["delta_period"]),
-                "cvd_threshold":        float(params["cvd"]["threshold"]),
-                "atr_multiplier_stop":  float(params["risk"]["atr_multiplier_stop"]),
-                "atr_multiplier_entry": float(params["risk"]["atr_multiplier_entry"]),
-                "atr_multiplier_tp":    float(params["risk"].get("atr_multiplier_tp", 4.0)),
-                "atr_multiplier_trail_offset": float(params["risk"].get("atr_multiplier_trail_offset", 2.0)),
-                "position_size_pct":    float(params["risk"].get("position_size_pct", 0.10)),
-                "max_trade_minutes":    int(params["risk"].get("max_trade_minutes", 240)),
+                "stochrsi_fast_period":  int(stoch.get("fast_period", 7)),
+                "stochrsi_slow_period":  int(stoch.get("slow_period", 21)),
+                "stochrsi_smooth":       int(stoch.get("smooth", 3)),
+                "stochrsi_oversold":     float(stoch.get("oversold", 20)),
+                "stochrsi_overbought":   float(stoch.get("overbought", 80)),
+                "cvd_delta_period":     int(cvd.get("delta_period", 10)),
+                "cvd_threshold":        float(cvd.get("threshold", 0.20)),
+                "atr_multiplier_stop":  float(risk.get("atr_multiplier_stop", self.atr_stop_mult.value)),
+                "atr_multiplier_entry": float(risk.get("atr_multiplier_entry", 1.0)),
+                "atr_multiplier_tp":    float(risk.get("atr_multiplier_tp", 4.0)),
+                "atr_multiplier_trail_offset": float(risk.get("atr_multiplier_trail_offset", self.atr_trail_offset.value)),
+                "position_size_pct":    float(risk.get("position_size_pct", 0.10)),
+                "max_trade_minutes":    int(risk.get("max_trade_minutes", self.max_trade_minutes_p.value)),
             }
         else:
             # Use hyperopt-testable parameters (falls back to defaults)
@@ -254,9 +263,9 @@ class MultiPairAdaptiveStrategy(IStrategy):
                 "atr_multiplier_stop":  self.atr_stop_mult.value,
                 "atr_multiplier_entry": 1.0,
                 "atr_multiplier_tp":    4.0,
-                "atr_multiplier_trail_offset": 2.0,
+                "atr_multiplier_trail_offset": float(self.atr_trail_offset.value),
                 "position_size_pct":    0.10,
-                "max_trade_minutes":    240,
+                "max_trade_minutes":    int(self.max_trade_minutes_p.value),
             }
 
         self._params_cache[pair] = resolved
@@ -303,6 +312,16 @@ class MultiPairAdaptiveStrategy(IStrategy):
         # (movimientos caóticos / manipulación)
         dataframe["volatility_shield"] = (dataframe["atr_ratio"] < 1.5).astype(int)
 
+        # --- 3b. EMA20 — distance-to-mean filter ------------------------
+        dataframe["ema20"] = ta.EMA(dataframe["close"], timeperiod=20)
+
+        # Distance from price to EMA20 in ATR units
+        dataframe["dist_to_mean"] = (
+            (dataframe["close"] - dataframe["ema20"]).abs() / dataframe["atr"]
+        )
+        # 1 = valid entry (price within 1.5 ATR of EMA20), 0 = bloqueado
+        dataframe["dist_mean_filter"] = (dataframe["dist_to_mean"] <= 1.5).astype(int)
+
         # --- 4. CVD rate-of-change on base TF (regime helper) -----------
         dataframe["cvd_delta"]    = dataframe["cvd"].diff(p["cvd_delta_period"])
         dataframe["cvd_delta_abs"] = dataframe["cvd_delta"].abs()
@@ -338,6 +357,7 @@ class MultiPairAdaptiveStrategy(IStrategy):
             pass
 
         # --- 8. EMA 50 en 4H — interruptor direccional estructural ------
+        # Rollback V23 → V22: EMA50(4H) es más estable que EMA20(1H).
         # Si precio < EMA50(4h) → solo SHORT
         # Si precio > EMA50(4h) → solo LONG
         try:
@@ -358,6 +378,44 @@ class MultiPairAdaptiveStrategy(IStrategy):
                 dataframe["ema50_direction"] = 1  # fallback: permitir ambos
         except Exception:
             dataframe["ema50_direction"] = 1
+
+        # --- 9. Volume Cascade Shield ------------------------------------
+        # Bloquea entradas si volumen actual > 3× media 20 velas.
+        # Típico de liquidaciones en cascada (cuchillos cayendo).
+        dataframe["vol_sma20"] = ta.SMA(dataframe["volume"], timeperiod=20)
+        dataframe["vol_ratio"] = dataframe["volume"] / dataframe["vol_sma20"]
+        dataframe["vol_cascade_shield"] = (dataframe["vol_ratio"] <= 3.0).astype(int)
+
+        # --- 10. Price Action filter — V24 ------------------------------
+        # Prohíbe comprar solo por oscilador. Exige que la vela de 15m
+        # cierre con cuerpo o con mecha de absorción en sobreventa/sobrecompra.
+        # --- LONG: close > open (bullish body) OR long lower wick in oversold
+        dataframe["pa_bullish_body"] = (dataframe["close"] > dataframe["open"]).astype(int)
+        dataframe["pa_lower_wick"] = dataframe["close"] - dataframe["low"]
+        dataframe["pa_upper_wick"] = dataframe["high"] - dataframe["close"]
+        # Lower wick > 2× upper wick AND StochRSI in oversold = absorption candle
+        dataframe["pa_absorption_long"] = (
+            (dataframe["stochrsi_k_fast"] < p["stochrsi_oversold"]) &
+            (dataframe["pa_lower_wick"] > 2 * dataframe["pa_upper_wick"])
+        ).astype(int)
+        # LONG confirmed: bullish body OR absorption wick
+        dataframe["pa_confirmed_long"] = (
+            (dataframe["pa_bullish_body"] == 1) |
+            (dataframe["pa_absorption_long"] == 1)
+        ).astype(int)
+
+        # --- SHORT: close < open (bearish body) OR long upper wick in overbought
+        dataframe["pa_bearish_body"] = (dataframe["close"] < dataframe["open"]).astype(int)
+        # Upper wick > 2× lower wick AND StochRSI in overbought = rejection candle
+        dataframe["pa_absorption_short"] = (
+            (dataframe["stochrsi_k_fast"] > p["stochrsi_overbought"]) &
+            (dataframe["pa_upper_wick"] > 2 * dataframe["pa_lower_wick"])
+        ).astype(int)
+        # SHORT confirmed: bearish body OR rejection wick
+        dataframe["pa_confirmed_short"] = (
+            (dataframe["pa_bearish_body"] == 1) |
+            (dataframe["pa_absorption_short"] == 1)
+        ).astype(int)
 
         return dataframe
 
@@ -385,7 +443,10 @@ class MultiPairAdaptiveStrategy(IStrategy):
             (dataframe["stochrsi_k_slow"] > 50) &
             (dataframe["volatility_shield"] == 1) &
             (dataframe["oi_confirmed"] == 1) &
-            (dataframe["ema50_direction"] == 1),
+            (dataframe["ema50_direction"] == 1) &
+            (dataframe["vol_cascade_shield"] == 1) &
+            (dataframe["pa_confirmed_long"] == 1) &
+            (dataframe["dist_mean_filter"] == 1),
             "enter_long",
         ] = 1
 
@@ -398,7 +459,10 @@ class MultiPairAdaptiveStrategy(IStrategy):
             (dataframe["stochrsi_k_slow"] < 50) &
             (dataframe["volatility_shield"] == 1) &
             (dataframe["oi_confirmed"] == 1) &
-            (dataframe["ema50_direction"] == 0),
+            (dataframe["ema50_direction"] == 0) &
+            (dataframe["vol_cascade_shield"] == 1) &
+            (dataframe["pa_confirmed_short"] == 1) &
+            (dataframe["dist_mean_filter"] == 1),
             "enter_short",
         ] = 1
 
@@ -413,7 +477,10 @@ class MultiPairAdaptiveStrategy(IStrategy):
             (dataframe["stochrsi_k_slow"] > 50) &
             (dataframe["volatility_shield"] == 1) &
             (dataframe["oi_confirmed"] == 1) &
-            (dataframe["ema50_direction"] == 1),
+            (dataframe["ema50_direction"] == 1) &
+            (dataframe["vol_cascade_shield"] == 1) &
+            (dataframe["pa_confirmed_long"] == 1) &
+            (dataframe["dist_mean_filter"] == 1),
             "enter_long",
         ] = 1
 
@@ -425,7 +492,10 @@ class MultiPairAdaptiveStrategy(IStrategy):
             (dataframe["stochrsi_k_slow"] < 50) &
             (dataframe["volatility_shield"] == 1) &
             (dataframe["oi_confirmed"] == 1) &
-            (dataframe["ema50_direction"] == 0),
+            (dataframe["ema50_direction"] == 0) &
+            (dataframe["vol_cascade_shield"] == 1) &
+            (dataframe["pa_confirmed_short"] == 1) &
+            (dataframe["dist_mean_filter"] == 1),
             "enter_short",
         ] = 1
 
@@ -463,11 +533,15 @@ class MultiPairAdaptiveStrategy(IStrategy):
         **kwargs,
     ) -> Optional[float]:
         p = self._params_for(pair)
-        partial = self._partial_exits.get(trade.id, False)
 
-        # --- Breakeven after partial exit ---
-        if partial:
-            be_stop = trade.open_rate * 0.999  # 0.1% below entry for fees
+        # --- Breakeven Hard-Lock after partial exit ---
+        # Lock remaining 50% at +0.1% profit the instant partial exit fires
+        # Neutraliza las pérdidas de -$116 que causaron los trailing stops en v21
+        if trade.id in self._partial_exits:
+            if trade.is_short:
+                be_stop = trade.open_rate * 0.999  # short: price -0.1% = profit
+            else:
+                be_stop = trade.open_rate * 1.001  # long: price +0.1% = profit
             stoploss_rel = (be_stop - trade.open_rate) / trade.open_rate
             return max(stoploss_rel, -0.15)
 
@@ -525,9 +599,7 @@ class MultiPairAdaptiveStrategy(IStrategy):
         if current_profit < 0:
             return None  # not profitable yet
 
-        # Track which trades already did the 50% exit
-        partial_key = f"partial_{trade.id}"
-        if partial_key in self._partial_exits:
+        if trade.id in self._partial_exits:
             return None  # already reduced
 
         p = self._params_for(trade.pair)
@@ -548,7 +620,7 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
         if current_profit > stop_distance:
             # Sell 50% — negative amount reduces position
-            self._partial_exits.add(partial_key)
+            self._partial_exits.add(trade.id)
             logger.info(
                 f"Partial exit 50% at {current_profit:.2%} profit for {trade.pair}"
             )
@@ -617,13 +689,15 @@ class MultiPairAdaptiveStrategy(IStrategy):
         **kwargs,
     ) -> float:
         """
-        Z-Score modulated position sizing (Half-Kelly 2%-6%).
+        Full-Kelly dynamic position sizing (4%-12% of wallet per trade).
 
-        Base: 5% of wallet (Half-Kelly).
-        Modulation: ATR Z-Score + signal confluence.
-        - ATR anómalo (> 1.5× media) → 2% (mínimo)
-        - ATR normal (0.8-1.2× media) → 5% (base)
-        - ATR comprimido (< 0.8× media) → 6% (máximo — calma = señal fiable)
+        Aprovecha el bajísimo DD del 0.8% para escalar el tamaño nominal
+        sin aumentar significativamente el riesgo de ruina.
+        - ATR comprimido (< 0.8× media) → 12% (máxima confianza)
+        - ATR normal (0.8-1.0× media) → 10%
+        - ATR ligeramente elevado (1.0-1.2× media) → 8%
+        - ATR elevado (1.2-1.5× media) → 6%
+        - ATR anómalo (> 1.5× media) → 4% (mínimo — shield activo)
         """
         p = self._params_for(pair)
         base_pct = p.get("position_size_pct", 0.05)
@@ -640,20 +714,20 @@ class MultiPairAdaptiveStrategy(IStrategy):
 
         atr_ratio = atr_ratio if atr_ratio > 0 else 1.0
 
-        # Z-Score inspired bands (ATR ratio is a proxy for Z-Score)
+        # Full-Kelly bands (ATR ratio proxies Z-Score)
         if atr_ratio < 0.8:
-            mult = 1.2    # 6% — calma, señal fiable
+            mult = 2.4    # 12% — ATR comprimido, señal fiable
         elif atr_ratio < 1.0:
-            mult = 1.0    # 5% — normal
+            mult = 2.0    # 10% — normal
         elif atr_ratio < 1.2:
-            mult = 0.8    # 4% — ligeramente volátil
+            mult = 1.6    # 8%  — ligeramente volátil
         elif atr_ratio < 1.5:
-            mult = 0.6    # 3% — volátil
+            mult = 1.2    # 6%  — volátil
         else:
-            mult = 0.4    # 2% — shield activo, mínimo riesgo
+            mult = 0.8    # 4%  — shield activo, mínimo riesgo
 
         pct = base_pct * mult
-        pct = max(0.02, min(0.06, pct))  # clamp 2%-6%
+        pct = max(0.04, min(0.12, pct))  # clamp 4%-12% (Full-Kelly)
 
         wallet = self.wallets.get_total_stake_amount()
         stake = wallet * pct
